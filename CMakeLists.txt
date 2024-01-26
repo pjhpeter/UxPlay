@@ -12,6 +12,12 @@ include(GNUInstallDirs)
 
 set ( CMAKE_CXX_STANDARD 11 )
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(AVCODEC REQUIRED libavcodec)
+pkg_check_modules(AVUTIL REQUIRED libavutil)
+pkg_check_modules(AVFORMAT REQUIRED libavformat)
+include_directories(${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS} ${AVFORMAT_INCLUDE_DIRS})
+
 if (ZOOMFIX )
   message (STATUS "cmake option ZOOMFIX is no longer used (if needed, ZOOMFIX is automatically applied if X11 libraries are present)" )
 endif()
@@ -51,6 +57,9 @@ add_executable( uxplay uxplay.cpp )
 target_link_libraries( uxplay
                    renderers
                    airplay
+                   ${AVCODEC_LIBRARIES}
+                   ${AVUTIL_LIBRARIES}
+                   ${AVFORMAT_LIBRARIES}
 		   )
 
 install( TARGETS  uxplay RUNTIME DESTINATION bin )

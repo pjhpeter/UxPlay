@@ -20,6 +20,9 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#include <libavutil/imgutils.h>
 #include "video_renderer.h"
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
@@ -40,6 +43,12 @@ static logger_t *logger = NULL;
 static unsigned short width, height, width_source, height_source;  /* not currently used */
 static bool first_packet = false;
 static bool sync = false;
+// 添加全局变量以跟踪上次保存图片的时间
+static GstClockTime last_saved_time = 0;
+// 在函数外部定义这些变量，以保持解码器上下文
+static AVCodecContext *codecContext = NULL;
+static const AVCodec *codec = NULL;
+static bool codec_initialized = false;
 
 struct video_renderer_s {
     GstElement *appsrc, *pipeline, *sink;
@@ -254,6 +263,7 @@ void video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_c
     GstBuffer *buffer;
     GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
+    GstClockTime current_time = gst_clock_get_time(gst_element_get_clock(renderer->pipeline));
     if (sync) {
         if (pts >= gst_video_pipeline_base_time) {
             pts -= gst_video_pipeline_base_time;
@@ -275,29 +285,174 @@ void video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_c
             logger_log(logger, LOGGER_INFO, "Begin streaming to GStreamer video pipeline");
             first_packet = false;
         }
-        buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
-        g_assert(buffer != NULL);
-        //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
-        if (sync) {
-            GST_BUFFER_PTS(buffer) = pts;
+
+        // 确保 NTP 时间戳有效
+        if (*ntp_time < gst_video_pipeline_base_time) {
+            logger_log(logger, LOGGER_ERR, "*** invalid ntp_time < gst_video_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
+                    ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_video_pipeline_base_time) / SECOND_IN_NSECS);
+            return;
         }
-        gst_buffer_fill(buffer, 0, data, *data_len);
-        gst_app_src_push_buffer (GST_APP_SRC(renderer->appsrc), buffer);
-#ifdef X_DISPLAY_FIX
-        if (renderer->gst_window && !(renderer->gst_window->window) && X11_search_attempts < MAX_X11_SEARCH_ATTEMPTS) {
-            X11_search_attempts++;
-            logger_log(logger, LOGGER_DEBUG, "Looking for X11 UxPlay Window, attempt %d", (int) X11_search_attempts);
-            get_x_window(renderer->gst_window, renderer->server_name);
-	    if (renderer->gst_window->window) {
-                logger_log(logger, LOGGER_INFO, "\n*** X11 Windows: Use key F11 or (left Alt)+Enter to toggle full-screen mode\n");
-                if (fullscreen) {
-                    set_fullscreen(renderer->gst_window, &fullscreen);
+
+        // 确保数据有效性
+        if (!(data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01)) {
+            logger_log(logger, LOGGER_ERR, "*** ERROR: Invalid NAL start code");
+            return;
+        }
+
+        // buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
+        // g_assert(buffer != NULL);
+        // //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
+        // if (sync) {
+        //     GST_BUFFER_PTS(buffer) = pts;
+        // }
+        // gst_buffer_fill(buffer, 0, data, *data_len);
+
+        // // 更新最后保存时间
+        // last_saved_time = current_time;
+
+        // gst_app_src_push_buffer (GST_APP_SRC(renderer->appsrc), buffer);
+
+        logger_log(logger, LOGGER_INFO, "开始图片解码");
+        if (!codec_initialized) {
+            // FFmpeg 解码器和解码上下文初始化
+            codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+            if (!codec) {
+                logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to find H264 codec");
+                return;
+            }
+
+            codecContext = avcodec_alloc_context3(codec);
+            if (!codecContext) {
+                logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to allocate codec context");
+                return;
+            }
+
+            if (avcodec_open2(codecContext, codec, NULL) < 0) {
+                logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to open codec");
+                avcodec_free_context(&codecContext);
+                return;
+            }
+            codec_initialized = true;
+        }
+        
+
+        // 创建一个新的 AVPacket 用于存储解码前的数据
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt) {
+            logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to allocate packet");
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        av_new_packet(pkt, *data_len);
+        memcpy(pkt->data, data, *data_len);
+
+        // 创建一个 AVFrame 用于存储解码后的数据
+        AVFrame *frame = av_frame_alloc();
+        if (!frame) {
+            logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to allocate frame");
+            av_packet_free(&pkt);
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        // 解码数据
+        int ret = avcodec_send_packet(codecContext, pkt);
+        if (ret < 0) {
+            logger_log(logger, LOGGER_ERR, "*** ERROR: avcodec_send_packet failed, code %d", ret);
+            av_packet_free(&pkt);
+            av_frame_free(&frame);
+            avcodec_close(codecContext);
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        if (avcodec_receive_frame(codecContext, frame) == 0) {
+            logger_log(logger, LOGGER_INFO, "图片解码完成");
+            // 检查是否已经过去了至少两秒
+            if (current_time - last_saved_time > 2 * GST_SECOND) {
+                last_saved_time = current_time;
+                logger_log(logger, LOGGER_INFO, "开始生成图片");
+                // 找到JPEG编码器
+                const AVCodec *jpegCodec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+
+                if (!jpegCodec) {
+                    logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to find JPEG codec");
+                    // 清理代码
+                    return;
                 }
-            } else if (X11_search_attempts == MAX_X11_SEARCH_ATTEMPTS) {
-	      logger_log(logger, LOGGER_DEBUG, "X11 UxPlay Window not found in %d search attempts", MAX_X11_SEARCH_ATTEMPTS);
+
+                // 创建JPEG编码器的上下文
+                AVCodecContext *jpegContext = avcodec_alloc_context3(jpegCodec);
+                if (!jpegContext) {
+                    logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to allocate JPEG codec context");
+                    // 清理代码
+                    return;
+                }
+
+                // 配置编码器上下文
+                jpegContext->pix_fmt = AV_PIX_FMT_YUVJ420P;
+                jpegContext->height = frame->height;
+                jpegContext->width = frame->width;
+                jpegContext->time_base = (AVRational){1, 25};
+                jpegContext->qmin = 10;
+                jpegContext->qmax = 10;
+
+                // 打开编码器
+                if (avcodec_open2(jpegContext, jpegCodec, NULL) < 0) {
+                    logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to open JPEG codec");
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // 创建JPEG数据包
+                AVPacket *jpegPkt = av_packet_alloc();
+                if (!jpegPkt) {
+                    // 错误处理
+                    return;
+                }
+
+                // 发送帧到编码器
+                if (avcodec_send_frame(jpegContext, frame) < 0) {
+                    logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to send frame to JPEG codec");
+                    av_packet_unref(jpegPkt);
+                    avcodec_close(jpegContext);
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // 接收编码后的数据
+                if (avcodec_receive_packet(jpegContext, jpegPkt) < 0) {
+                    logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to receive packet from JPEG codec");
+                    av_packet_unref(jpegPkt);
+                    avcodec_close(jpegContext);
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // 保存JPEG图片
+                FILE *jpegFile = fopen("output.jpg", "wb");
+                if (!jpegFile) {
+                    logger_log(logger, LOGGER_ERR, "*** ERROR: Failed to open file for JPEG output");
+                } else {
+                    fwrite(jpegPkt->data, 1, jpegPkt->size, jpegFile);
+                    fclose(jpegFile);
+                    logger_log(logger, LOGGER_INFO, "图片生成完毕");
+                }
+
+                // 清理JPEG编码器
+                av_packet_free(&jpegPkt);
+                avcodec_close(jpegContext);
+                avcodec_free_context(&jpegContext);
             }
         }
-#endif
+
+        // 清理。注意：不要关闭和释放codecContext，除非你确定不再需要它
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
     }
 }
 
@@ -331,6 +486,10 @@ void video_renderer_destroy() {
 #endif    
         free (renderer);
         renderer = NULL;
+
+        codec_initialized = false;
+        avcodec_close(codecContext);
+        avcodec_free_context(&codecContext);
     }
 }
 
