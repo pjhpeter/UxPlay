@@ -66,7 +66,7 @@
 
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000UL
-#define DEFAULT_NAME "UxPlay"
+#define DEFAULT_NAME "BootingAI"
 #define DEFAULT_DEBUG_LOG false
 #define LOWEST_ALLOWED_PORT 1024
 #define HIGHEST_PORT 65535
@@ -115,7 +115,7 @@ static unsigned char audio_type = 0x00;
 static unsigned char previous_audio_type = 0x00;
 static bool fullscreen = false;
 static std::string coverart_filename = "";
-static bool do_append_hostname = true;
+static bool do_append_hostname = false;
 static bool use_random_hw_addr = false;
 static unsigned short display[5] = {0}, tcp[3] = {0}, udp[3] = {0};
 static bool debug_log = DEFAULT_DEBUG_LOG;

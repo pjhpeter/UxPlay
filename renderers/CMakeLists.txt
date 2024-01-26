@@ -13,18 +13,6 @@ else()
 endif()
 
 find_package( PkgConfig REQUIRED )
-if ( X11_FOUND )
-  message (STATUS "Will use X_DISPLAY_FIX" )
-  add_definitions( -DX_DISPLAY_FIX )
-  pkg_check_modules (GST120 gstreamer-1.0>=1.20)
-  if ( GST120_FOUND )
-    message( "--   ZOOMFIX will NOT be applied as Gstreamer version is >= 1.20" )
-  else()
-    message( "--   Failure to find Gstreamer >= 1.20 is NOT an error!" )
-    message( "--   ZOOMFIX will be applied as Gstreamer version is < 1.20" )
-    add_definitions( -DZOOM_WINDOW_NAME_FIX )
-  endif()
-endif()
 
 pkg_check_modules(GST REQUIRED    gstreamer-1.0>=1.4 
                                   gstreamer-sdp-1.0>=1.4

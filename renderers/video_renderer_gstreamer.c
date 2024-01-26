@@ -28,14 +28,6 @@
 #include <gst/app/gstappsrc.h>
 
 #define SECOND_IN_NSECS 1000000000UL
-#ifdef X_DISPLAY_FIX
-#include <gst/video/navigation.h>
-#include "x_display_fix.h"
-static bool fullscreen = false;
-static bool alt_keypress = false;
-#define MAX_X11_SEARCH_ATTEMPTS 5   /*should be less than 256 */
-static unsigned char X11_search_attempts; 
-#endif
 
 static video_renderer_t *renderer = NULL;
 static GstClockTime gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
@@ -53,10 +45,6 @@ static bool codec_initialized = false;
 struct video_renderer_s {
     GstElement *appsrc, *pipeline, *sink;
     GstBus *bus;
-#ifdef  X_DISPLAY_FIX
-    const char * server_name;  
-    X11_Window_t * gst_window;
-#endif
 };
 
 static void append_videoflip (GString *launch, const videoflip_t *flip, const videoflip_t *rot) {
@@ -194,29 +182,6 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
     renderer->sink = gst_bin_get_by_name (GST_BIN (renderer->pipeline), "video_sink");
     g_assert(renderer->sink);
 
-#ifdef X_DISPLAY_FIX
-    fullscreen = *initial_fullscreen;
-    renderer->server_name = server_name;
-    renderer->gst_window = NULL;
-    bool x_display_fix = false;
-    /* only include X11 videosinks that provide fullscreen mode, or need ZOOMFIX */
-    /* limit searching for X11 Windows in case autovideosink selects an incompatible videosink */
-    if (strncmp(videosink,"autovideosink", strlen("autovideosink")) == 0 ||
-        strncmp(videosink,"ximagesink", strlen("ximagesink")) ==  0 ||
-	strncmp(videosink,"xvimagesink", strlen("xvimagesink")) == 0 ||
-	strncmp(videosink,"fpsdisplaysink", strlen("fpsdisplaysink")) == 0 ) {
-        x_display_fix = true;
-    }
-    if (x_display_fix) {
-        renderer->gst_window = calloc(1, sizeof(X11_Window_t));
-        g_assert(renderer->gst_window);
-        get_X11_Display(renderer->gst_window);
-        if (!renderer->gst_window->display) {
-            free(renderer->gst_window);
-            renderer->gst_window = NULL;
-        }
-    }
-#endif
     gst_element_set_state (renderer->pipeline, GST_STATE_READY);
     GstState state;
     if (gst_element_get_state (renderer->pipeline, &state, NULL, 0)) {
@@ -254,9 +219,6 @@ void video_renderer_start() {
     gst_video_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
     renderer->bus = gst_element_get_bus(renderer->pipeline);
     first_packet = true;
-#ifdef X_DISPLAY_FIX
-    X11_search_attempts = 0;
-#endif
 }
 
 void video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time) {
@@ -312,7 +274,6 @@ void video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_c
 
         // gst_app_src_push_buffer (GST_APP_SRC(renderer->appsrc), buffer);
 
-        logger_log(logger, LOGGER_INFO, "开始图片解码");
         if (!codec_initialized) {
             // FFmpeg 解码器和解码上下文初始化
             codec = avcodec_find_decoder(AV_CODEC_ID_H264);
@@ -368,11 +329,9 @@ void video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_c
         }
 
         if (avcodec_receive_frame(codecContext, frame) == 0) {
-            logger_log(logger, LOGGER_INFO, "图片解码完成");
             // 检查是否已经过去了至少两秒
             if (current_time - last_saved_time > 2 * GST_SECOND) {
                 last_saved_time = current_time;
-                logger_log(logger, LOGGER_INFO, "开始生成图片");
                 // 找到JPEG编码器
                 const AVCodec *jpegCodec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
 
@@ -440,7 +399,6 @@ void video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_c
                 } else {
                     fwrite(jpegPkt->data, 1, jpegPkt->size, jpegFile);
                     fclose(jpegFile);
-                    logger_log(logger, LOGGER_INFO, "图片生成完毕");
                 }
 
                 // 清理JPEG编码器
@@ -478,12 +436,6 @@ void video_renderer_destroy() {
         gst_object_unref(renderer->sink);
         gst_object_unref (renderer->appsrc);
         gst_object_unref (renderer->pipeline);
-#ifdef X_DISPLAY_FIX
-        if (renderer->gst_window) {
-            free(renderer->gst_window);
-            renderer->gst_window = NULL;
-        }
-#endif    
         free (renderer);
         renderer = NULL;
 
@@ -529,43 +481,6 @@ gboolean gstreamer_pipeline_bus_callback(GstBus *bus, GstMessage *message, gpoin
          logger_log(logger, LOGGER_INFO, "GStreamer: End-Of-Stream");
 	//   g_main_loop_quit( (GMainLoop *) loop);
         break;
-#ifdef  X_DISPLAY_FIX
-    case GST_MESSAGE_ELEMENT:
-        if (renderer->gst_window && renderer->gst_window->window) {
-            GstNavigationMessageType message_type = gst_navigation_message_get_type (message);
-            if (message_type == GST_NAVIGATION_MESSAGE_EVENT) {
-                GstEvent *event = NULL;
-                if (gst_navigation_message_parse_event (message, &event)) {
-                    GstNavigationEventType event_type = gst_navigation_event_get_type (event);
-                    const gchar *key;
-                    switch (event_type) {
-                    case GST_NAVIGATION_EVENT_KEY_PRESS:
-                        if (gst_navigation_event_parse_key_event (event, &key)) {
-                            if ((strcmp (key, "F11") == 0) || (alt_keypress && strcmp (key, "Return") == 0)) {
-                                fullscreen = !(fullscreen);
-                                set_fullscreen(renderer->gst_window, &fullscreen);
-                            } else if (strcmp (key, "Alt_L") == 0) {
-                                alt_keypress = true;
-                            }
-                        }
-                        break;
-                    case GST_NAVIGATION_EVENT_KEY_RELEASE:
-                        if (gst_navigation_event_parse_key_event (event, &key)) {
-                            if (strcmp (key, "Alt_L") == 0) {
-                                alt_keypress = false;
-                            }
-                        }
-                    default:
-                        break;
-                    }
-                }
-                if (event) {
-                    gst_event_unref (event);
-                }
-            }
-        }
-        break;
-#endif
     default:
       /* unhandled message */
         break;
