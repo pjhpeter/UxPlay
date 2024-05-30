@@ -41,9 +41,7 @@
 #include <unordered_map>
 #include <winsock2.h>
 #include <iphlpapi.h>
-
 #include <ws2tcpip.h>
-
 #else
 #include <glib-unix.h>
 #include <sys/utsname.h>
@@ -51,9 +49,7 @@
 #include <ifaddrs.h>
 #include <sys/types.h>
 #include <pwd.h>
-
 #include <netinet/in.h>
-
 # ifdef __linux__
 # include <netpacket/packet.h>
 # else
