@@ -415,6 +415,18 @@ static guint g_unix_signal_add(gint signum, GSourceFunc handler, gpointer user_d
 }
 #endif
 
+#ifdef _WIN32
+bool initWinsock() {
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        std::cerr << "WSAStartup failed: " << result << std::endl;
+        return false;
+    }
+    return true;
+}
+#endif
+
 int createSocket() {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
