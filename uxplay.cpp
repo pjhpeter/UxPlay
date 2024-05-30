@@ -71,6 +71,7 @@ extern "C" {
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <chrono>
 
 
 #define VERSION "1.68"
