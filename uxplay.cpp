@@ -370,26 +370,26 @@ static void dump_video_to_file(unsigned char *data, int datalen) {
     }
 }
 
-#ifdef _WIN32
-struct signal_handler {
-    GSourceFunc handler;
-    gpointer user_data;
-};
+// #ifdef _WIN32
+// struct signal_handler {
+//     GSourceFunc handler;
+//     gpointer user_data;
+// };
 
-static std::unordered_map<gint, signal_handler> u = {};
+// static std::unordered_map<gint, signal_handler> u = {};
 
-static void SignalHandler(int signum) {
-    if (signum == SIGTERM || signum == SIGINT) {
-        u[signum].handler(u[signum].user_data);
-    }
-}
+// static void SignalHandler(int signum) {
+//     if (signum == SIGTERM || signum == SIGINT) {
+//         u[signum].handler(u[signum].user_data);
+//     }
+// }
 
-static guint g_unix_signal_add(gint signum, GSourceFunc handler, gpointer user_data) {
-    u[signum] = signal_handler{handler, user_data};
-    (void) signal(signum, SignalHandler);
-    return 0;
-}
-#endif
+// static guint g_unix_signal_add(gint signum, GSourceFunc handler, gpointer user_data) {
+//     u[signum] = signal_handler{handler, user_data};
+//     (void) signal(signum, SignalHandler);
+//     return 0;
+// }
+// #endif
 
 #ifdef _WIN32
 bool initWinsock() {
