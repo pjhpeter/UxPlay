@@ -35,7 +35,6 @@
 #include <cstdio>
 #include <stdarg.h>
 #include <math.h>
-#include <iostream>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
 #include <glib.h>
@@ -71,6 +70,7 @@ extern "C" {
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <iostream>
 #include <chrono>
 
 
