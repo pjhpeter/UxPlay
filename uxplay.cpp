@@ -29,22 +29,37 @@
 #include <algorithm>
 #include <vector>
 #include <fstream>
+#include <iostream>
 #include <sstream>
+#include <thread>
 #include <iterator>
 #include <sys/stat.h>
 #include <cstdio>
 #include <stdarg.h>
 #include <math.h>
+#include <chrono>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/buffer.h>
+#include <csignal>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#include <libavutil/imgutils.h>
+}
 
 #ifdef _WIN32  /*modifications for Windows compilation */
-#include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>
 #include <iphlpapi.h>
+#include <windows.h>
+#include <Lmcons.h>
+typedef int socklen_t;
 #else
-#include <glib-unix.h>
+#include <stdlib.h>
 #include <sys/utsname.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <ifaddrs.h>
 #include <sys/types.h>
 #include <pwd.h>
@@ -59,14 +74,12 @@
 #include "lib/stream.h"
 #include "lib/logger.h"
 #include "lib/dnssd.h"
-#include "renderers/video_renderer.h"
-#include "renderers/audio_renderer.h"
 
 #define VERSION "1.68"
 
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000UL
-#define DEFAULT_NAME "撞色"
+#define DEFAULT_NAME "Look"
 #define DEFAULT_DEBUG_LOG false
 #define LOWEST_ALLOWED_PORT 1024
 #define HIGHEST_PORT 65535
@@ -81,16 +94,16 @@ static bool audio_sync = false;
 static bool video_sync = true;
 static int64_t audio_delay_alac = 0;
 static int64_t audio_delay_aac = 0;
+static bool started = false;
 static bool relaunch_video = false;
 static bool reset_loop = false;
 static unsigned int open_connections= 0;
 static std::string videosink = "autovideosink";
-static videoflip_t videoflip[2] = { NONE , NONE };
 static bool use_video = true;
 static unsigned char compression_type = 0;
 static std::string audiosink = "autoaudiosink";
 static int  audiodelay = -1;
-static bool use_audio = true;
+static bool use_audio = false;
 static bool new_window_closing_behavior = true;
 static bool close_window;
 static std::string video_parser = "h264parse";
@@ -115,7 +128,7 @@ static unsigned char audio_type = 0x00;
 static unsigned char previous_audio_type = 0x00;
 static bool fullscreen = false;
 static std::string coverart_filename = "";
-static bool do_append_hostname = false;
+static bool do_append_hostname = true;
 static bool use_random_hw_addr = false;
 static unsigned short display[5] = {0}, tcp[3] = {0}, udp[3] = {0};
 static bool debug_log = DEFAULT_DEBUG_LOG;
@@ -140,6 +153,16 @@ static std::vector <std::string> registered_keys;
 static double db_low = -30.0;
 static double db_high = 0.0;
 static bool taper_volume = false;
+static bool first_packet = false;
+// 添加全局变量以跟踪上次保存图片的时间
+static std::chrono::steady_clock::time_point last_saved_time = std::chrono::steady_clock::now();
+static bool first_time = true;
+// 在函数外部定义这些变量，以保持解码器上下文
+static AVCodecContext *codecContext = NULL;
+static const AVCodec *codec = NULL;
+static bool codec_initialized = false;
+int server_fd = -1; // 全局变量
+int new_socket = -1; // 全局变量
 
 /* logging */
 
@@ -349,64 +372,162 @@ static void dump_video_to_file(unsigned char *data, int datalen) {
     }
 }
 
-static gboolean reset_callback(gpointer loop) {
-    if (reset_loop) {
-        g_main_loop_quit((GMainLoop *) loop);
-    }
-    return TRUE;
-}
-
-static gboolean  sigint_callback(gpointer loop) {
-    relaunch_video = false;
-    g_main_loop_quit((GMainLoop *) loop);
-    return TRUE;
-}
-
-static gboolean  sigterm_callback(gpointer loop) {
-    relaunch_video = false;
-    g_main_loop_quit((GMainLoop *) loop);
-    return TRUE;
-}
-
 #ifdef _WIN32
-struct signal_handler {
-    GSourceFunc handler;
-    gpointer user_data;
-};
-
-static std::unordered_map<gint, signal_handler> u = {};
-
-static void SignalHandler(int signum) {
-    if (signum == SIGTERM || signum == SIGINT) {
-        u[signum].handler(u[signum].user_data);
+bool initWinsock() {
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        std::cerr << "WSAStartup failed: " << result << std::endl;
+        return false;
     }
-}
-
-static guint g_unix_signal_add(gint signum, GSourceFunc handler, gpointer user_data) {
-    u[signum] = signal_handler{handler, user_data};
-    (void) signal(signum, SignalHandler);
-    return 0;
+    return true;
 }
 #endif
 
+int createSocket() {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        std::cerr << "Failed to create socket." << std::endl;
+        return -1;
+    }
+    return sockfd;
+}
+
+bool bindSocket(int sockfd, int port) {
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    if (bind(sockfd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        std::cerr << "Bind failed." << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool listenOnSocket(int sockfd) {
+    if (listen(sockfd, 3) < 0) {
+        std::cerr << "Listen failed." << std::endl;
+        return false;
+    }
+    std::cout << "Listened" << std::endl;
+    return true;
+}
+
+int acceptConnection(int sockfd) {
+    struct sockaddr_in address;
+    socklen_t addrlen = sizeof(address);
+    int new_socket = accept(sockfd, (struct sockaddr*)&address, &addrlen);
+    if (new_socket < 0) {
+        std::cerr << "Accept failed." << std::endl;
+        return -1;
+    }
+    return new_socket;
+}
+
+void cleanup(int sockfd) {
+    #ifdef _WIN32
+    closesocket(sockfd);
+    WSACleanup();
+    #else
+    close(sockfd);
+    #endif
+}
+
+bool sendData(int sockfd, const std::string& message) {
+    ssize_t bytes_sent = send(sockfd, message.c_str(), message.length(), 0);
+    if (bytes_sent < 0) {
+        std::cerr << "Failed to send message." << std::endl;
+        return false;
+    }
+    return true;
+}
+
+
+std::string receiveData(int sockfd) {
+    char buffer[1024] = {0};
+    ssize_t bytes_received = recv(sockfd, buffer, sizeof(buffer), 0);
+    if (bytes_received < 0) {
+        std::cerr << "Failed to receive message." << std::endl;
+        return "";
+    }
+    return std::string(buffer, bytes_received);
+}
+
+
+bool fileExists(const std::string& filename) {
+    // 创建一个ifstream对象
+    std::ifstream file(filename);
+
+    // 检查文件是否成功打开
+    return file.good();
+}
+
+void signalHandler(int signum) {
+    std::cout << "捕获到信号 " << signum << std::endl;
+    // 执行清理操作...
+    cleanup(server_fd);
+    // 安全地退出程序
+    exit(signum);
+}
+
+void exitReceiver() {
+    server_fd = -1;
+    new_socket = -1;
+    relaunch_video = false;
+    reset_loop = false;
+    started = false;
+    cleanup(server_fd);
+}
+
 static void main_loop()  {
-    guint gst_bus_watch_id = 0;
-    GMainLoop *loop = g_main_loop_new(NULL,FALSE);
+    // 注册信号SIGTERM的处理器
+    signal(SIGTERM, signalHandler);
     relaunch_video = false;
     if (use_video) {
         relaunch_video = true;
-        gst_bus_watch_id = (guint) video_renderer_listen((void *)loop);
     }
-    guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
-    guint sigterm_watch_id = g_unix_signal_add(SIGTERM, (GSourceFunc) sigterm_callback, (gpointer) loop);
-    guint sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
-    g_main_loop_run(loop);
 
-    if (gst_bus_watch_id > 0) g_source_remove(gst_bus_watch_id);
-    if (sigint_watch_id > 0) g_source_remove(sigint_watch_id);
-    if (sigterm_watch_id > 0) g_source_remove(sigterm_watch_id);
-    if (reset_watch_id > 0) g_source_remove(reset_watch_id);
-    g_main_loop_unref(loop);
+    #ifdef _WIN32
+    if (!initWinsock()) {
+        exitReceiver();
+        return;
+    }
+    #endif
+
+    server_fd = createSocket();
+    if (server_fd < 0) {
+        exitReceiver();
+        return;
+    }
+
+    if (!bindSocket(server_fd, 64666)) {
+        exitReceiver();
+        return;
+    }
+
+    if (!listenOnSocket(server_fd)) {
+        exitReceiver();
+        return;
+    }
+
+    new_socket = acceptConnection(server_fd);
+    if (new_socket < 0) {
+        exitReceiver();
+        return;
+    }
+
+    started = true;
+    while (started) {
+        std::string message = receiveData(new_socket);
+        std::cout << message << std::endl;
+        if (!message.empty() && message == "close") {
+            // 接收到关闭服务的指令
+            exitReceiver();
+        }
+    }
 }    
 
 static int parse_hw_addr (std::string str, std::vector<char> &hw_addr) {
@@ -719,55 +840,25 @@ static bool get_ports (int nports, std::string option, const char * value, unsig
     return false;
 }
 
-static bool get_videoflip (const char *str, videoflip_t *videoflip) {
-    if (strlen(str) > 1) return false;
-    switch (str[0]) {
-        case 'I':
-            *videoflip = INVERT;
-            break;
-        case 'H':
-            *videoflip = HFLIP;
-            break;
-        case 'V':
-            *videoflip = VFLIP;
-            break;
-        default:
-            return false;
-    }
-    return true;
-}
-
-static bool get_videorotate (const char *str, videoflip_t *videoflip) {
-    if (strlen(str) > 1) return false;
-    switch (str[0]) {
-        case 'L':
-            *videoflip = LEFT;
-            break;
-        case 'R':
-            *videoflip = RIGHT;
-            break;
-        default:
-            return false;
-    }
-    return true;
-}
 
 static void append_hostname(std::string &server_name) {
 #ifdef _WIN32   /*modification for compilation on Windows */
     char buffer[256] = "";
     unsigned long size = sizeof(buffer);
-    if (GetComputerNameA(buffer, &size)) {
+    char username[UNLEN + 1];
+    DWORD username_len = UNLEN + 1;
+    if (GetUserName(username, &username_len)) {
         std::string name = server_name;
         name.append("@");
-        name.append(buffer);
+        name.append(username);
         server_name = name;
     }
 #else
-    struct utsname buf;
-    if (!uname(&buf)) {
+    const char* username = getenv("USER");
+    if (username != nullptr) {
         std::string name = server_name;
         name.append("@");
-        name.append(buf.nodename);
+        name.append(username);
         server_name = name;
     }
 #endif
@@ -859,16 +950,8 @@ static void parse_arguments (int argc, char *argv[]) {
             display[4] = 1;
         } else if (arg == "-f") {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
-            if (!get_videoflip(argv[++i], &videoflip[0])) {
-                fprintf(stderr,"invalid \"-f %s\" , unknown flip type, choices are H, V, I\n",argv[i]);
-                exit(1);
-            }
         } else if (arg == "-r") {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
-            if (!get_videorotate(argv[++i], &videoflip[1])) {
-                fprintf(stderr,"invalid \"-r %s\" , unknown rotation  type, choices are R, L\n",argv[i]);
-                exit(1);
-            }
         } else if (arg == "-p") {
             if (i == argc - 1 || argv[i + 1][0] == '-') {
                 tcp[0] = 7100; tcp[1] = 7000; tcp[2] = 7001;
@@ -1397,9 +1480,6 @@ extern "C" void conn_destroy (void *cls) {
     LOGD("Open connections: %i", open_connections);
     if (open_connections == 0) {
         remote_clock_offset = 0;
-        if (use_audio) {
-            audio_renderer_stop();
-        }
         if (dacpfile.length()) {
             remove (dacpfile.c_str());
         }    
@@ -1466,7 +1546,206 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
         default:
             break;
         }
-        audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
+    }
+}
+
+std::string base64_encode(const unsigned char* buffer, size_t length) {
+    BIO *bio, *b64;
+    BUF_MEM *bufferPtr;
+
+    b64 = BIO_new(BIO_f_base64());
+    bio = BIO_new(BIO_s_mem());
+    bio = BIO_push(b64, bio);
+
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL); // 忽略换行符
+    BIO_write(bio, buffer, length);
+    BIO_flush(bio);
+    BIO_get_mem_ptr(bio, &bufferPtr);
+    BIO_set_close(bio, BIO_NOCLOSE);
+
+    std::string result(bufferPtr->data, bufferPtr->length);
+    BIO_free_all(bio);
+    return result;
+}
+
+static void h264_decoder(unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time) {
+    /* first four bytes of valid  h264  video data are 0x00, 0x00, 0x00, 0x01.    *
+     * nal_count is the number of NAL units in the data: short SPS, PPS, SEI NALs *
+     * may  precede a VCL NAL. Each NAL starts with 0x00 0x00 0x00 0x01 and is    *
+     * byte-aligned: the first byte of invalid data (decryption failed) is 0x01   */
+    if (data[0]) {
+        LOGI("*** ERROR decryption of video packet failed ");
+        std::cerr << "*** ERROR decryption of video packet failed " << std::endl;
+    } else {
+        if (first_packet) {
+            LOGI("Begin streaming to GStreamer video pipeline");
+            std::cerr << "Begin streaming to GStreamer video pipeline" << std::endl;
+            first_packet = false;
+        }
+
+        // 确保数据有效性
+        if (!(data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01)) {
+            LOGI("*** ERROR: Invalid NAL start code");
+            std::cerr << "*** ERROR: Invalid NAL start code" << std::endl;
+            return;
+        }
+
+        if (!codec_initialized) {
+            // FFmpeg 解码器和解码上下文初始化
+            codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+            if (!codec) {
+                LOGI("*** ERROR: Failed to find H264 codec");
+                std::cerr << "*** ERROR: Failed to find H264 codec" << std::endl;
+                return;
+            }
+
+            codecContext = avcodec_alloc_context3(codec);
+            if (!codecContext) {
+                LOGI("*** ERROR: Failed to allocate codec context");
+                std::cerr << "*** ERROR: Failed to allocate codec context" << std::endl;
+                return;
+            }
+
+            if (avcodec_open2(codecContext, codec, NULL) < 0) {
+                LOGI("*** ERROR: Failed to open codec");
+                std::cerr << "*** ERROR: Failed to open codec" << std::endl;
+                avcodec_free_context(&codecContext);
+                return;
+            }
+            codec_initialized = true;
+        }
+        
+
+        // 创建一个新的 AVPacket 用于存储解码前的数据
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt) {
+            LOGI("*** ERROR: Failed to allocate packet");
+            std::cerr << "*** ERROR: Failed to allocate packet" << std::endl;
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        av_new_packet(pkt, *data_len);
+        memcpy(pkt->data, data, *data_len);
+
+        // 创建一个 AVFrame 用于存储解码后的数据
+        AVFrame *frame = av_frame_alloc();
+        if (!frame) {
+            LOGI("*** ERROR: Failed to allocate frame");
+            std::cerr << "*** ERROR: Failed to allocate frame" << std::endl;
+            av_packet_free(&pkt);
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        // 解码数据
+        int ret = avcodec_send_packet(codecContext, pkt);
+        if (ret < 0) {
+            LOGI("*** ERROR: avcodec_send_packet failed, code %d", ret);
+            std::cerr << "*** ERROR: avcodec_send_packet failed, code " << ret << std::endl;
+            av_packet_free(&pkt);
+            av_frame_free(&frame);
+            avcodec_close(codecContext);
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        if (avcodec_receive_frame(codecContext, frame) == 0 && new_socket > -1) {
+            // 检查是否已经过去了至少1秒
+            auto current_time = std::chrono::steady_clock::now();
+            if (first_time || std::chrono::duration_cast<std::chrono::seconds>(current_time - last_saved_time).count() >= 1) {
+                last_saved_time = current_time;
+                // 找到JPEG编码器
+                const AVCodec *jpegCodec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+
+                if (!jpegCodec) {
+                    LOGI("*** ERROR: Failed to find JPEG codec");
+                    std::cerr << "*** ERROR: Failed to find JPEG codec" << std::endl;
+                    // 清理代码
+                    return;
+                }
+
+                // 创建JPEG编码器的上下文
+                AVCodecContext *jpegContext = avcodec_alloc_context3(jpegCodec);
+                if (!jpegContext) {
+                    LOGI("*** ERROR: Failed to allocate JPEG codec context");
+                    std::cerr << "*** ERROR: Failed to allocate JPEG codec context" << std::endl;
+                    // 清理代码
+                    return;
+                }
+
+                // 配置编码器上下文
+                jpegContext->pix_fmt = AV_PIX_FMT_YUVJ420P;
+                jpegContext->height = frame->height;
+                jpegContext->width = frame->width;
+                jpegContext->time_base = (AVRational){1, 25};
+                jpegContext->qmin = 10;
+                jpegContext->qmax = 10;
+
+                // 打开编码器
+                if (avcodec_open2(jpegContext, jpegCodec, NULL) < 0) {
+                    LOGI("*** ERROR: Failed to open JPEG codec");
+                    std::cerr << "*** ERROR: Failed to open JPEG codec" << std::endl;
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // 创建JPEG数据包
+                AVPacket *jpegPkt = av_packet_alloc();
+                if (!jpegPkt) {
+                    // 错误处理
+                    return;
+                }
+
+                // 发送帧到编码器
+                if (avcodec_send_frame(jpegContext, frame) < 0) {
+                    LOGI("*** ERROR: Failed to send frame to JPEG codec");
+                    std::cerr << "*** ERROR: Failed to send frame to JPEG codec" << std::endl;
+                    av_packet_unref(jpegPkt);
+                    avcodec_close(jpegContext);
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // 接收编码后的数据
+                if (avcodec_receive_packet(jpegContext, jpegPkt) < 0) {
+                    LOGI("*** ERROR: Failed to receive packet from JPEG codec");
+                    std::cerr << "*** ERROR: Failed to receive packet from JPEG codec" << std::endl;
+                    av_packet_unref(jpegPkt);
+                    avcodec_close(jpegContext);
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // // 保存JPEG图片
+                // FILE *jpegFile = fopen("./output_temp.jpg", "wb");
+                // if (!jpegFile) {
+                //     LOGI("*** ERROR: Failed to open file for JPEG output");
+                //     std::cerr << "*** ERROR: Failed to open file for JPEG output" << std::endl;
+                // } else {
+                //     fwrite(jpegPkt->data, 1, jpegPkt->size, jpegFile);
+                //     fclose(jpegFile);
+                //     rename("./output_temp.jpg", "./output.jpg");
+                //     std::cout << "图片更新成功" << std::endl;
+                // }
+                // 将JPEG数据转换为Base64
+                std::string base64Image = base64_encode(jpegPkt->data, jpegPkt->size);
+                std::string message = "BEGIN~" + base64Image + "~END";
+                sendData(new_socket, message);
+
+                // 清理JPEG编码器
+                av_packet_free(&jpegPkt);
+                avcodec_close(jpegContext);
+                avcodec_free_context(&jpegContext);
+            }
+        }
+
+        // 清理。注意：不要关闭和释放codecContext，除非你确定不再需要它
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
     }
 }
 
@@ -1479,37 +1758,37 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, h264_decode_struct *d
             remote_clock_offset = data->ntp_time_local - data->ntp_time_remote;
         }
         data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
-        video_renderer_render_buffer(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
+        h264_decoder(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
     }
 }
 
 extern "C" void video_pause (void *cls) {
     if (use_video) {
-        video_renderer_pause();
+        // video_renderer_pause();
     }
 }
 
 extern "C" void video_resume (void *cls) {
     if (use_video) {
-        video_renderer_resume();
+        // video_renderer_resume();
     }
 }
 
 
 extern "C" void audio_flush (void *cls) {
     if (use_audio) {
-        audio_renderer_flush();
+        // audio_renderer_flush();
     }
 }
 
 extern "C" void video_flush (void *cls) {
     if (use_video) {
-        video_renderer_flush();
+        // video_renderer_flush();
     }
 }
 
 extern "C" void audio_set_volume (void *cls, float volume) {
-    double db, db_flat, frac, gst_volume;
+    double db, db_flat, frac;
     if (!use_audio) {
       return;
     }
@@ -1534,7 +1813,6 @@ extern "C" void audio_set_volume (void *cls, float volume) {
     /* frac is length of volume slider as fraction of max length */
     /* also (steps/16) where steps is number of discrete steps above mute (16 = full volume) */
     if (frac == 0.0) {
-        gst_volume = 0.0;
     } else {
       /* flat rescaling of decibel range from {-30dB : 0dB} to {db_low : db_high} */  
         db_flat = db_low + (db_high-db_low) * frac;
@@ -1547,10 +1825,7 @@ extern "C" void audio_set_volume (void *cls, float volume) {
          } else {
             db = db_flat;
         }
-	/* conversion from (gain) decibels to GStreamer's linear volume scale */
-        gst_volume = pow(10.0, 0.05*db);
     }
-    audio_renderer_set_volume(gst_volume);
 }
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
@@ -1574,7 +1849,7 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     audio_type = type;
     
     if (use_audio) {
-      audio_renderer_start(ct);
+    //   audio_renderer_start(ct);
     }
 
     if (coverart_filename.length()) {
@@ -1584,7 +1859,7 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
 
 extern "C" void video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
     if (use_video) {
-        video_renderer_size(width_source, height_source, width, height);
+        // video_renderer_size(width_source, height_source, width, height);
     }
 }
 
@@ -1848,21 +2123,8 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
         free (argv);
     }
 }
-#ifdef GST_MACOS
-/* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
-#include <TargetConditionals.h>
-#include <gst/gstmacos.h>
-void real_main (int argc, char *argv[]);
 
 int main (int argc, char *argv[]) {
-  printf("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*\n");
-  return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
-}
-
-void real_main (int argc, char *argv[]) {
-#else
-int main (int argc, char *argv[]) {
-#endif
     std::vector<char> server_hw_addr;
     std::string config_file = "";
 
@@ -1914,7 +2176,6 @@ int main (int argc, char *argv[]) {
     LOGI("macOS detected: use -nc option as workaround for GStreamer problem");
     new_window_closing_behavior = false;
 #endif
-
     if (videosink == "0") {
         use_video = false;
 	videosink.erase();
@@ -1991,26 +2252,9 @@ int main (int argc, char *argv[]) {
         append_hostname(server_name);
     }
 
-    if (!gstreamer_init()) {
-        LOGE ("stopping");
-        exit (1);
-    }
-
     render_logger = logger_init();
     logger_set_callback(render_logger, log_callback, NULL);
     logger_set_level(render_logger, log_level);
-
-    if (use_audio) {
-      audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync);
-    } else {
-        LOGI("audio_disabled");
-    }
-
-    if (use_video) {
-        video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
-                            video_decoder.c_str(), video_converter.c_str(), videosink.c_str(), &fullscreen, &video_sync);
-        video_renderer_start();
-    }
 
     if (udp[0]) {
         LOGI("using network ports UDP %d %d %d TCP %d %d %d", udp[0], udp[1], udp[2], tcp[0], tcp[1], tcp[2]);
@@ -2030,7 +2274,6 @@ int main (int argc, char *argv[]) {
         LOGI("using randomly-generated MAC address %s",mac_address.c_str());
     }
     parse_hw_addr(mac_address, server_hw_addr);
-
     if (coverart_filename.length()) {
         LOGI("any AirPlay audio cover-art will be written to file  %s",coverart_filename.c_str());
         write_coverart(coverart_filename.c_str(), (const void *) empty_image, sizeof(empty_image));
@@ -2059,14 +2302,6 @@ int main (int argc, char *argv[]) {
         } else {
             raop_stop(raop);
         }
-        if (use_audio) audio_renderer_stop();
-        if (use_video && close_window) {
-            video_renderer_destroy();
-            video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
-                                video_decoder.c_str(), video_converter.c_str(), videosink.c_str(), &fullscreen,
-                                &video_sync);
-            video_renderer_start();
-        }
         if (relaunch_video) {
             unsigned short port = raop_get_port(raop);
             raop_start(raop, &port);
@@ -2084,12 +2319,6 @@ int main (int argc, char *argv[]) {
         stop_dnssd();
     }
     cleanup:
-    if (use_audio) {
-        audio_renderer_destroy();
-    }
-    if (use_video)  {
-        video_renderer_destroy();
-    }
     logger_destroy(render_logger);
     render_logger = NULL;
     if(audio_dumpfile) {
