@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <stdarg.h>
 #include <math.h>
+#include <iostream>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
 #include <glib.h>
@@ -61,6 +62,16 @@
 #include "lib/dnssd.h"
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#include <libavutil/imgutils.h>
+}
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/buffer.h>
+
 
 #define VERSION "1.68"
 
@@ -140,6 +151,16 @@ static std::vector <std::string> registered_keys;
 static double db_low = -30.0;
 static double db_high = 0.0;
 static bool taper_volume = false;
+
+static bool first_packet = false;
+static bool first_time = true;
+static std::chrono::steady_clock::time_point last_saved_time = std::chrono::steady_clock::now();
+// 在函数外部定义这些变量，以保持解码器上下文
+static AVCodecContext *codecContext = NULL;
+static const AVCodec *codec = NULL;
+static bool codec_initialized = false;
+int server_fd = -1; // 全局变量
+int new_socket = -1; // 全局变量
 
 /* logging */
 
@@ -1470,6 +1491,215 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
     }
 }
 
+bool sendData(int sockfd, const std::string& message) {
+    ssize_t bytes_sent = send(sockfd, message.c_str(), message.length(), 0);
+    if (bytes_sent < 0) {
+        std::cerr << "Failed to send message." << std::endl;
+        return false;
+    }
+    return true;
+}
+
+std::string base64_encode(const unsigned char* buffer, size_t length) {
+    BIO *bio, *b64;
+    BUF_MEM *bufferPtr;
+
+    b64 = BIO_new(BIO_f_base64());
+    bio = BIO_new(BIO_s_mem());
+    bio = BIO_push(b64, bio);
+
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL); // 忽略换行符
+    BIO_write(bio, buffer, length);
+    BIO_flush(bio);
+    BIO_get_mem_ptr(bio, &bufferPtr);
+    BIO_set_close(bio, BIO_NOCLOSE);
+
+    std::string result(bufferPtr->data, bufferPtr->length);
+    BIO_free_all(bio);
+    return result;
+}
+
+static void h264_decoder(unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time) {
+    /* first four bytes of valid  h264  video data are 0x00, 0x00, 0x00, 0x01.    *
+     * nal_count is the number of NAL units in the data: short SPS, PPS, SEI NALs *
+     * may  precede a VCL NAL. Each NAL starts with 0x00 0x00 0x00 0x01 and is    *
+     * byte-aligned: the first byte of invalid data (decryption failed) is 0x01   */
+    if (data[0]) {
+        LOGI("*** ERROR decryption of video packet failed ");
+        std::cerr << "*** ERROR decryption of video packet failed " << std::endl;
+    } else {
+        if (first_packet) {
+            LOGI("Begin streaming to GStreamer video pipeline");
+            std::cerr << "Begin streaming to GStreamer video pipeline" << std::endl;
+            first_packet = false;
+        }
+
+        // 确保数据有效性
+        if (!(data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01)) {
+            LOGI("*** ERROR: Invalid NAL start code");
+            std::cerr << "*** ERROR: Invalid NAL start code" << std::endl;
+            return;
+        }
+
+        if (!codec_initialized) {
+            // FFmpeg 解码器和解码上下文初始化
+            codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+            if (!codec) {
+                LOGI("*** ERROR: Failed to find H264 codec");
+                std::cerr << "*** ERROR: Failed to find H264 codec" << std::endl;
+                return;
+            }
+
+            codecContext = avcodec_alloc_context3(codec);
+            if (!codecContext) {
+                LOGI("*** ERROR: Failed to allocate codec context");
+                std::cerr << "*** ERROR: Failed to allocate codec context" << std::endl;
+                return;
+            }
+
+            if (avcodec_open2(codecContext, codec, NULL) < 0) {
+                LOGI("*** ERROR: Failed to open codec");
+                std::cerr << "*** ERROR: Failed to open codec" << std::endl;
+                avcodec_free_context(&codecContext);
+                return;
+            }
+            codec_initialized = true;
+        }
+        
+
+        // 创建一个新的 AVPacket 用于存储解码前的数据
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt) {
+            LOGI("*** ERROR: Failed to allocate packet");
+            std::cerr << "*** ERROR: Failed to allocate packet" << std::endl;
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        av_new_packet(pkt, *data_len);
+        memcpy(pkt->data, data, *data_len);
+
+        // 创建一个 AVFrame 用于存储解码后的数据
+        AVFrame *frame = av_frame_alloc();
+        if (!frame) {
+            LOGI("*** ERROR: Failed to allocate frame");
+            std::cerr << "*** ERROR: Failed to allocate frame" << std::endl;
+            av_packet_free(&pkt);
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        // 解码数据
+        int ret = avcodec_send_packet(codecContext, pkt);
+        if (ret < 0) {
+            LOGI("*** ERROR: avcodec_send_packet failed, code %d", ret);
+            std::cerr << "*** ERROR: avcodec_send_packet failed, code " << ret << std::endl;
+            av_packet_free(&pkt);
+            av_frame_free(&frame);
+            avcodec_close(codecContext);
+            avcodec_free_context(&codecContext);
+            return;
+        }
+
+        if (avcodec_receive_frame(codecContext, frame) == 0 && new_socket > -1) {
+            // 检查是否已经过去了至少1秒
+            auto current_time = std::chrono::steady_clock::now();
+            if (first_time || std::chrono::duration_cast<std::chrono::seconds>(current_time - last_saved_time).count() >= 1) {
+                last_saved_time = current_time;
+                // 找到JPEG编码器
+                const AVCodec *jpegCodec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+
+                if (!jpegCodec) {
+                    LOGI("*** ERROR: Failed to find JPEG codec");
+                    std::cerr << "*** ERROR: Failed to find JPEG codec" << std::endl;
+                    // 清理代码
+                    return;
+                }
+
+                // 创建JPEG编码器的上下文
+                AVCodecContext *jpegContext = avcodec_alloc_context3(jpegCodec);
+                if (!jpegContext) {
+                    LOGI("*** ERROR: Failed to allocate JPEG codec context");
+                    std::cerr << "*** ERROR: Failed to allocate JPEG codec context" << std::endl;
+                    // 清理代码
+                    return;
+                }
+
+                // 配置编码器上下文
+                jpegContext->pix_fmt = AV_PIX_FMT_YUVJ420P;
+                jpegContext->height = frame->height;
+                jpegContext->width = frame->width;
+                jpegContext->time_base = (AVRational){1, 25};
+                jpegContext->qmin = 10;
+                jpegContext->qmax = 10;
+
+                // 打开编码器
+                if (avcodec_open2(jpegContext, jpegCodec, NULL) < 0) {
+                    LOGI("*** ERROR: Failed to open JPEG codec");
+                    std::cerr << "*** ERROR: Failed to open JPEG codec" << std::endl;
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // 创建JPEG数据包
+                AVPacket *jpegPkt = av_packet_alloc();
+                if (!jpegPkt) {
+                    // 错误处理
+                    return;
+                }
+
+                // 发送帧到编码器
+                if (avcodec_send_frame(jpegContext, frame) < 0) {
+                    LOGI("*** ERROR: Failed to send frame to JPEG codec");
+                    std::cerr << "*** ERROR: Failed to send frame to JPEG codec" << std::endl;
+                    av_packet_unref(jpegPkt);
+                    avcodec_close(jpegContext);
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // 接收编码后的数据
+                if (avcodec_receive_packet(jpegContext, jpegPkt) < 0) {
+                    LOGI("*** ERROR: Failed to receive packet from JPEG codec");
+                    std::cerr << "*** ERROR: Failed to receive packet from JPEG codec" << std::endl;
+                    av_packet_unref(jpegPkt);
+                    avcodec_close(jpegContext);
+                    avcodec_free_context(&jpegContext);
+                    // 清理代码
+                    return;
+                }
+
+                // // 保存JPEG图片
+                // FILE *jpegFile = fopen("./output_temp.jpg", "wb");
+                // if (!jpegFile) {
+                //     LOGI("*** ERROR: Failed to open file for JPEG output");
+                //     std::cerr << "*** ERROR: Failed to open file for JPEG output" << std::endl;
+                // } else {
+                //     fwrite(jpegPkt->data, 1, jpegPkt->size, jpegFile);
+                //     fclose(jpegFile);
+                //     rename("./output_temp.jpg", "./output.jpg");
+                //     std::cout << "图片更新成功" << std::endl;
+                // }
+                // 将JPEG数据转换为Base64
+                std::string base64Image = base64_encode(jpegPkt->data, jpegPkt->size);
+                std::string message = "BEGIN~" + base64Image + "~END";
+                sendData(new_socket, message);
+
+                // 清理JPEG编码器
+                av_packet_free(&jpegPkt);
+                avcodec_close(jpegContext);
+                avcodec_free_context(&jpegContext);
+            }
+        }
+
+        // 清理。注意：不要关闭和释放codecContext，除非你确定不再需要它
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+    }
+}
+
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, h264_decode_struct *data) {
     if (dump_video) {
         dump_video_to_file(data->data, data->data_len);
@@ -1479,7 +1709,7 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, h264_decode_struct *d
             remote_clock_offset = data->ntp_time_local - data->ntp_time_remote;
         }
         data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
-        video_renderer_render_buffer(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
+        h264_decoder(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
     }
 }
 
