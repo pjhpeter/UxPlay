@@ -37,13 +37,11 @@
 #include <math.h>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
-#include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
 #else
-#include <glib-unix.h>
 #include <sys/utsname.h>
 #include <sys/socket.h>
 #include <ifaddrs.h>
@@ -61,8 +59,6 @@
 #include "lib/stream.h"
 #include "lib/logger.h"
 #include "lib/dnssd.h"
-#include "renderers/video_renderer.h"
-#include "renderers/audio_renderer.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -81,7 +77,7 @@ extern "C" {
 
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000UL
-#define DEFAULT_NAME "撞色"
+#define DEFAULT_NAME "Look"
 #define DEFAULT_DEBUG_LOG false
 #define LOWEST_ALLOWED_PORT 1024
 #define HIGHEST_PORT 65535
@@ -100,7 +96,6 @@ static bool relaunch_video = false;
 static bool reset_loop = false;
 static unsigned int open_connections= 0;
 static std::string videosink = "autovideosink";
-static videoflip_t videoflip[2] = { NONE , NONE };
 static bool use_video = true;
 static unsigned char compression_type = 0;
 static std::string audiosink = "autoaudiosink";
@@ -373,25 +368,6 @@ static void dump_video_to_file(unsigned char *data, int datalen) {
             fwrite(data, 1, datalen, video_dumpfile);
         }
     }
-}
-
-static gboolean reset_callback(gpointer loop) {
-    if (reset_loop) {
-        g_main_loop_quit((GMainLoop *) loop);
-    }
-    return TRUE;
-}
-
-static gboolean  sigint_callback(gpointer loop) {
-    relaunch_video = false;
-    g_main_loop_quit((GMainLoop *) loop);
-    return TRUE;
-}
-
-static gboolean  sigterm_callback(gpointer loop) {
-    relaunch_video = false;
-    g_main_loop_quit((GMainLoop *) loop);
-    return TRUE;
 }
 
 #ifdef _WIN32
@@ -1082,39 +1058,6 @@ static bool get_ports (int nports, std::string option, const char * value, unsig
     return false;
 }
 
-static bool get_videoflip (const char *str, videoflip_t *videoflip) {
-    if (strlen(str) > 1) return false;
-    switch (str[0]) {
-        case 'I':
-            *videoflip = INVERT;
-            break;
-        case 'H':
-            *videoflip = HFLIP;
-            break;
-        case 'V':
-            *videoflip = VFLIP;
-            break;
-        default:
-            return false;
-    }
-    return true;
-}
-
-static bool get_videorotate (const char *str, videoflip_t *videoflip) {
-    if (strlen(str) > 1) return false;
-    switch (str[0]) {
-        case 'L':
-            *videoflip = LEFT;
-            break;
-        case 'R':
-            *videoflip = RIGHT;
-            break;
-        default:
-            return false;
-    }
-    return true;
-}
-
 static void append_hostname(std::string &server_name) {
 #ifdef _WIN32   /*modification for compilation on Windows */
     char buffer[256] = "";
@@ -1222,16 +1165,8 @@ static void parse_arguments (int argc, char *argv[]) {
             display[4] = 1;
         } else if (arg == "-f") {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
-            if (!get_videoflip(argv[++i], &videoflip[0])) {
-                fprintf(stderr,"invalid \"-f %s\" , unknown flip type, choices are H, V, I\n",argv[i]);
-                exit(1);
-            }
         } else if (arg == "-r") {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
-            if (!get_videorotate(argv[++i], &videoflip[1])) {
-                fprintf(stderr,"invalid \"-r %s\" , unknown rotation  type, choices are R, L\n",argv[i]);
-                exit(1);
-            }
         } else if (arg == "-p") {
             if (i == argc - 1 || argv[i + 1][0] == '-') {
                 tcp[0] = 7100; tcp[1] = 7000; tcp[2] = 7001;
@@ -1761,7 +1696,6 @@ extern "C" void conn_destroy (void *cls) {
     if (open_connections == 0) {
         remote_clock_offset = 0;
         if (use_audio) {
-            audio_renderer_stop();
         }
         if (dacpfile.length()) {
             remove (dacpfile.c_str());
@@ -1829,7 +1763,7 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
         default:
             break;
         }
-        audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
+        // audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
     }
 }
 
@@ -1848,26 +1782,26 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, h264_decode_struct *d
 
 extern "C" void video_pause (void *cls) {
     if (use_video) {
-        video_renderer_pause();
+        // video_renderer_pause();
     }
 }
 
 extern "C" void video_resume (void *cls) {
     if (use_video) {
-        video_renderer_resume();
+        // video_renderer_resume();
     }
 }
 
 
 extern "C" void audio_flush (void *cls) {
     if (use_audio) {
-        audio_renderer_flush();
+        // audio_renderer_flush();
     }
 }
 
 extern "C" void video_flush (void *cls) {
     if (use_video) {
-        video_renderer_flush();
+        // video_renderer_flush();
     }
 }
 
@@ -1913,7 +1847,7 @@ extern "C" void audio_set_volume (void *cls, float volume) {
 	/* conversion from (gain) decibels to GStreamer's linear volume scale */
         gst_volume = pow(10.0, 0.05*db);
     }
-    audio_renderer_set_volume(gst_volume);
+    // audio_renderer_set_volume(gst_volume);
 }
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
@@ -1937,7 +1871,7 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     audio_type = type;
     
     if (use_audio) {
-      audio_renderer_start(ct);
+    //   audio_renderer_start(ct);
     }
 
     if (coverart_filename.length()) {
@@ -1947,7 +1881,7 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
 
 extern "C" void video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
     if (use_video) {
-        video_renderer_size(width_source, height_source, width, height);
+        // video_renderer_size(width_source, height_source, width, height);
     }
 }
 
@@ -2354,25 +2288,20 @@ int main (int argc, char *argv[]) {
         append_hostname(server_name);
     }
 
-    if (!gstreamer_init()) {
-        LOGE ("stopping");
-        exit (1);
-    }
-
     render_logger = logger_init();
     logger_set_callback(render_logger, log_callback, NULL);
     logger_set_level(render_logger, log_level);
 
     if (use_audio) {
-      audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync);
+    //   audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync);
     } else {
         LOGI("audio_disabled");
     }
 
     if (use_video) {
-        video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
-                            video_decoder.c_str(), video_converter.c_str(), videosink.c_str(), &fullscreen, &video_sync);
-        video_renderer_start();
+        // video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
+        //                     video_decoder.c_str(), video_converter.c_str(), videosink.c_str(), &fullscreen, &video_sync);
+        // video_renderer_start();
     }
 
     if (udp[0]) {
@@ -2422,13 +2351,13 @@ int main (int argc, char *argv[]) {
         } else {
             raop_stop(raop);
         }
-        if (use_audio) audio_renderer_stop();
+        // if (use_audio) audio_renderer_stop();
         if (use_video && close_window) {
-            video_renderer_destroy();
-            video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
-                                video_decoder.c_str(), video_converter.c_str(), videosink.c_str(), &fullscreen,
-                                &video_sync);
-            video_renderer_start();
+            // video_renderer_destroy();
+            // video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
+            //                     video_decoder.c_str(), video_converter.c_str(), videosink.c_str(), &fullscreen,
+            //                     &video_sync);
+            // video_renderer_start();
         }
         if (relaunch_video) {
             unsigned short port = raop_get_port(raop);
@@ -2447,12 +2376,12 @@ int main (int argc, char *argv[]) {
         stop_dnssd();
     }
     cleanup:
-    if (use_audio) {
-        audio_renderer_destroy();
-    }
-    if (use_video)  {
-        video_renderer_destroy();
-    }
+    // if (use_audio) {
+    //     audio_renderer_destroy();
+    // }
+    // if (use_video)  {
+    //     video_renderer_destroy();
+    // }
     logger_destroy(render_logger);
     render_logger = NULL;
     if(audio_dumpfile) {
